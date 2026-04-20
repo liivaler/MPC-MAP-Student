@@ -3,5 +3,5 @@
 % map_name = 'maps/mixed_1.txt';
 
 %% task 5
-start_position = [5, 3, pi/6];
-map_name = 'maps/week3_map.txt';
+start_position = [2, 2, pi/2];
+map_name = 'maps/outdoor_1.txt';
