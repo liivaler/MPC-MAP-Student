@@ -1,79 +1,124 @@
 function public_vars = student_workspace(read_only_vars, public_vars)
-% STUDENT_WORKSPACE
+% STUDENT_WORKSPACE - Week 6
 
-    % -------------------------
-    % Initialization
-    % -------------------------
-    if ~isfield(public_vars, 'kf_initialized')
-        public_vars = init_kalman_filter(read_only_vars, public_vars);
-        public_vars.kf_initialized = true;
+    if ~isfield(public_vars, 'initialized')
+
+        public_vars.initialized = true;
+
+        % Initial pose
+        if isfield(read_only_vars, 'mocap_pose') && all(isfinite(read_only_vars.mocap_pose(1:3)))
+            public_vars.estimated_pose = read_only_vars.mocap_pose;
+        else
+            public_vars.estimated_pose = [1, 1, pi/2];
+        end
+
+        % Plan path once
+        public_vars.path = plan_path(read_only_vars, public_vars);
+
+        % Make first path point exactly equal to robot start position
+        if ~isempty(public_vars.path)
+            public_vars.path(1,:) = public_vars.estimated_pose(1:2);
+        end
+
+        if ~isempty(public_vars.path) && size(public_vars.path,1) >= 2
+            public_vars.wp_idx = 2;
+        else
+            public_vars.wp_idx = 1;
+        end
 
         public_vars.motion_vector = [0, 0];
-        public_vars.motion_vector_prev = [0, 0];
+        public_vars.prev_motion_vector = [0, 0];
+
+        disp('Planned path size:');
+        disp(size(public_vars.path));
     end
 
-    % -------------------------
-    % Task 4: GNSS-based initialization
-    % Robot stands still and collects GNSS samples
-    % -------------------------
-    if public_vars.use_gnss_initialization && ~public_vars.gnss_initialized
+    % ------------------------------------------------------------
+    % Current pose
+    % ------------------------------------------------------------
+    if isfield(read_only_vars, 'mocap_pose') && all(isfinite(read_only_vars.mocap_pose(1:3)))
 
-        z = read_only_vars.gnss_position(:);
+        pose = read_only_vars.mocap_pose;
 
-        if all(isfinite(z))
-            public_vars.gnss_init_buffer = [public_vars.gnss_init_buffer; z(:)'];
-        end
+    else
 
-        % Wait until enough samples are collected
-        if size(public_vars.gnss_init_buffer, 1) >= public_vars.gnss_init_samples_needed
+        pose = public_vars.estimated_pose;
 
-            X = public_vars.gnss_init_buffer;
+        vR_old = public_vars.prev_motion_vector(1);
+        vL_old = public_vars.prev_motion_vector(2);
 
-            % Mean GNSS position
-            mu_xy = mean(X, 1)';
+        L = read_only_vars.agent_drive.interwheel_dist;
+        dt = read_only_vars.sampling_period;
 
-            % GNSS covariance
-            Q_xy = cov(X);
-            % Use estimated GNSS covariance as measurement covariance
-            public_vars.kf.Q = Q_xy;
+        v_old = (vR_old + vL_old) / 2;
+        w_old = (vR_old - vL_old) / L;
 
-            % Initial state belief
-            public_vars.mu = [mu_xy(1); mu_xy(2); 0];
+        pose(1) = pose(1) + v_old * cos(pose(3)) * dt;
+        pose(2) = pose(2) + v_old * sin(pose(3)) * dt;
+        pose(3) = pose(3) + w_old * dt;
+        pose(3) = atan2(sin(pose(3)), cos(pose(3)));
+    end
 
-            % Initial covariance:
-            % x,y from GNSS covariance, theta large variance
-            public_vars.sigma = [Q_xy(1,1), Q_xy(1,2), 0;
-                                 Q_xy(2,1), Q_xy(2,2), 0;
-                                 0,         0,         public_vars.initial_theta_variance];
+    public_vars.estimated_pose = pose;
 
-            public_vars.gnss_initialized = true;
-        end
-
-        % During GNSS initialization robot must stand still
+    % ------------------------------------------------------------
+    % Stop if no path
+    % ------------------------------------------------------------
+    if isempty(public_vars.path)
         public_vars.motion_vector = [0, 0];
-        public_vars.motion_vector_prev = [0, 0];
-
-        % Estimated pose for visualization
-        public_vars.estimated_pose = public_vars.mu(:)';
-
+        public_vars.prev_motion_vector = [0, 0];
         return;
     end
+    
+    % ------------------------------------------------------------
+    % Waypoint following - original simple version
+    % ------------------------------------------------------------
+    target = public_vars.path(public_vars.wp_idx,:);
 
-    % -------------------------
-    % Normal EKF operation
-    % -------------------------
+    while norm(target - pose(1:2)) < 0.25 && public_vars.wp_idx < size(public_vars.path,1)
+        public_vars.wp_idx = public_vars.wp_idx + 1;
+        target = public_vars.path(public_vars.wp_idx,:);
+    end
 
-    % EKF uses previous control input
-    public_vars.motion_vector = public_vars.motion_vector_prev;
-    [public_vars.mu, public_vars.sigma] = update_kalman_filter(read_only_vars, public_vars);
+    % ------------------------------------------------------------
+    % Stop at final goal
+    % ------------------------------------------------------------
+   if public_vars.wp_idx >= size(public_vars.path,1)
+        if norm(target - pose(1:2)) < 0.2
+            public_vars.motion_vector = [0, 0];
+            public_vars.prev_motion_vector = [0, 0];
+            return;
+        end
+    end
+    % ------------------------------------------------------------
+    % Controller - slightly improved version
+    % ------------------------------------------------------------
+    dx = target(1) - pose(1);
+    dy = target(2) - pose(2);
 
-    % Estimated pose for visualization
-    public_vars.estimated_pose = public_vars.mu(:)';
+    target_heading = atan2(dy, dx);
+    heading_error = atan2(sin(target_heading - pose(3)), cos(target_heading - pose(3)));
 
-    % Compute new motion control from EKF estimate
-    [motion_vector, public_vars] = plan_motion(read_only_vars, public_vars);
+    L = read_only_vars.agent_drive.interwheel_dist;
 
-    % Save command for next step
-    public_vars.motion_vector_prev = motion_vector;
-    public_vars.motion_vector = motion_vector;
+    % Do not stop completely, only slow down when angle is large
+    if abs(heading_error) > pi/3
+        v = 0.1;
+    else
+        v = 0.25;
+    end
+
+    w = 1.5 * heading_error;
+    w = max(min(w, 0.45), -0.45);
+
+    vR = v + (L/2) * w;
+    vL = v - (L/2) * w;
+
+    maxVel = read_only_vars.agent_drive.max_vel;
+
+    vR = max(min(vR, maxVel), -maxVel);
+    vL = max(min(vL, maxVel), -maxVel);
+
+    public_vars.motion_vector = [vR, vL];
+    public_vars.prev_motion_vector = public_vars.motion_vector;
 end
