@@ -1,5 +1,7 @@
-function [path] = plan_path(read_only_vars, public_vars)
-% PLAN_PATH - Week 6
+function path = plan_path(read_only_vars, public_vars)
+% PLAN_PATH
+% Week 6 path planning wrapper.
+% Uses A* and optional smoothing.
 
     raw_path = astar(read_only_vars, public_vars);
 
@@ -8,14 +10,15 @@ function [path] = plan_path(read_only_vars, public_vars)
         return;
     end
 
-    path = smooth_path(raw_path, read_only_vars);
+    path = raw_path;
 
+    try
+        smoothed = smooth_path(raw_path, read_only_vars);
+
+        if ~isempty(smoothed) && size(smoothed,1) >= 2
+            path = smoothed;
+        end
+    catch
+        path = raw_path;
+    end
 end
-
-% function [path] = plan_path(read_only_vars, public_vars)
-% % PLAN_PATH - Week 6
-% 
-%     disp('PLANNING WITHOUT SMOOTHING');
-%     path = astar(read_only_vars, public_vars);
-% 
-% end

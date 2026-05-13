@@ -1,115 +1,92 @@
 function [motion_vector, public_vars] = plan_motion(read_only_vars, public_vars)
 % PLAN_MOTION
-% Stable path following using EKF estimate only
+% Target-point path following with limited forward speed when heading error is large.
 
-    if ~isfield(public_vars, 'initialized')
-        public_vars.initialized = true;
-
-        % safer smooth-ish path
-        p = [ ...
-            2.0, 2.0;
-            2.0, 4.8;
-            3.2, 6.0;
-            5.0, 7.0;
-            7.5, 7.2;
-            10.0, 6.9;
-            12.7, 6.7;
-            14.0, 4.5;
-            16.0, 2.0
-        ];
-
-        path = [];
-        points_per_segment = 15;
-
-        for i = 1:size(p,1)-1
-            xs = linspace(p(i,1), p(i+1,1), points_per_segment)';
-            ys = linspace(p(i,2), p(i+1,2), points_per_segment)';
-            seg = [xs ys];
-
-            if i < size(p,1)-1
-                seg(end,:) = [];
-            end
-
-            path = [path; seg];
-        end
-
-        public_vars.path = path;
-
-        % filtered pose memory
-        public_vars.pose_filt = public_vars.mu(:)';
-
-        % filtered wheel command memory
-        public_vars.motion_filt = [0, 0];
+    if ~isfield(public_vars, 'path') || isempty(public_vars.path)
+        motion_vector = [0.10 0.10];
+        return;
     end
+
+    if ~isfield(public_vars, 'path_idx')
+        public_vars.path_idx = 1;
+    end
+
+    pose = public_vars.estimated_pose(:)';
+
+    if numel(pose) ~= 3 || any(~isfinite(pose))
+        motion_vector = [0 0];
+        return;
+    end
+
+    x = pose(1);
+    y = pose(2);
+    theta = atan2(sin(pose(3)), cos(pose(3)));
 
     path = public_vars.path;
     N = size(path,1);
 
-    %% 1) EKF pose estimate
-    pose = public_vars.mu(:)';
-    x = pose(1);
-    y = pose(2);
-    theta = pose(3);
+    goal = read_only_vars.map.goal(1:2);
+    goal_tol = min(read_only_vars.map.goal_tolerance, 0.50);
 
-    %% 2) filter whole pose
-    alpha_p = 0.15;   % smaller = smoother
-    public_vars.pose_filt = (1-alpha_p)*public_vars.pose_filt + alpha_p*[x y theta];
-
-    x = public_vars.pose_filt(1);
-    y = public_vars.pose_filt(2);
-    theta = public_vars.pose_filt(3);
-    theta = atan2(sin(theta), cos(theta));
-
-    %% 3) stop near final goal
-    goal = path(end,:);
-    if norm([x - goal(1), y - goal(2)]) < 0.35
-        motion_vector = [0, 0];
+    if hypot(x - goal(1), y - goal(2)) < goal_tol
+        motion_vector = [0 0];
         return;
     end
 
-    %% 4) find nearest path point
-    d2 = (path(:,1) - x).^2 + (path(:,2) - y).^2;
-    [~, nearest_idx] = min(d2);
+    public_vars.path_idx = min(max(public_vars.path_idx, 1), N);
 
-    %% 5) choose a small lookahead target
-    lookahead = 4;
-    target_idx = min(nearest_idx + lookahead, N);
+    while public_vars.path_idx < N
+        wp = path(public_vars.path_idx,:);
+
+        if hypot(x - wp(1), y - wp(2)) < 0.35
+            public_vars.path_idx = public_vars.path_idx + 1;
+        else
+            break;
+        end
+    end
+
+    % Slight lookahead smooths the path, but keep it short in indoor corridors.
+    lookahead =2;
+    target_idx = min(public_vars.path_idx + lookahead, N);
     target = path(target_idx,:);
 
     dx = target(1) - x;
     dy = target(2) - y;
 
     target_angle = atan2(dy, dx);
-    err = wrapToPi(target_angle - theta);
+    err = atan2(sin(target_angle - theta), cos(target_angle - theta));
 
-    %% 6) gentle controller
-    v = 0.10 + 0.10*max(0, cos(err));
-    w = 0.2 * err;
+    % Forward speed. Do not push hard when the robot is not facing the path.
+    v = 0.32 * max(0.30, cos(err));
 
-    % stronger slowdown in larger turns
-    if abs(err) > 0.9
-        v = 0.03;
-    elseif abs(err) > 0.5
-        v = min(v, 0.07);
+    if abs(err) > 1.0
+        v = 0.08;
+    elseif abs(err) > 0.6
+        v = min(v, 0.15);
     end
 
-    % angular saturation
-    w = max(min(w, 0.25), -0.25);
+    % Slow down a bit near the goal.
+    d_goal = hypot(x - goal(1), y - goal(2));
+    if d_goal < 1.2
+        v = min(v, 0.18);
+    end
 
-    %% 7) differential drive conversion
+    w = 1.2 * err;
+    w = max(min(w, 1.2), -1.2);
+
     L = read_only_vars.agent_drive.interwheel_dist;
+
     vR = v + (L/2)*w;
     vL = v - (L/2)*w;
 
-    %% 8) wheel speed saturation
-    maxVel = 0.35 * read_only_vars.agent_drive.max_vel;
+    maxVel = 0.42;
+
     vR = max(min(vR, maxVel), -maxVel);
     vL = max(min(vL, maxVel), -maxVel);
 
-    %% 9) filter output command to avoid twitching
-    beta_u = 0.85;  % larger = smoother
-    cmd = [vR, vL];   % simulator likely expects [left, right]
-    public_vars.motion_filt = beta_u*public_vars.motion_filt + (1-beta_u)*cmd;
+    motion_vector = [vR vL];
 
-    motion_vector = public_vars.motion_filt;
+    if all(abs(motion_vector) < 1e-4)
+        motion_vector = [0.08 0.08];
+    end
 end

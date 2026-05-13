@@ -37,7 +37,7 @@ function safe = is_path_safe(path, read_only_vars)
     walls = read_only_vars.map.walls;
     limits = read_only_vars.map.limits;
 
-    clearance = 0.2;
+    clearance = 0.3;
 
     xmin = limits(1);
     ymin = limits(2);
