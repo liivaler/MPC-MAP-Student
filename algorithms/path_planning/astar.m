@@ -1,6 +1,4 @@
 function best_path = astar(read_only_vars, public_vars)
-% ASTAR
-% Toolbox-free A* path planner for final project.
 
     occ_map = double(read_only_vars.discrete_map.map ~= 0);
 
@@ -18,7 +16,7 @@ function best_path = astar(read_only_vars, public_vars)
     goal_xy = read_only_vars.map.goal(1:2);
     goal_xy = goal_xy(:)';
 
-    clearances = [0.22 0.2 0.19 0.18 0.16];
+    clearances = [0.39 0.35 0.29 0.24 0.2];
 
     best_path = [];
 
@@ -256,7 +254,7 @@ function safe = is_path_safe(path, walls, limits, clearance)
         p2 = path(i+1,:);
 
         dist = norm(p2-p1);
-        n = max(2, ceil(dist / 0.05));
+        n = max(2, ceil(dist / 0.10));
 
         for k = 0:n
             s = k / n;

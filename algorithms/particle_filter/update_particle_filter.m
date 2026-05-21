@@ -97,19 +97,12 @@ function [particles, weights] = update_particle_filter(read_only_vars, public_va
     particles = roughen_particles(particles, read_only_vars, lock_count);
 
     % ------------------------------------------------------------
-    % 6) Recompute weights after resampling + roughening
+    % 6) Keep uniform weights after resampling + roughening
     % ------------------------------------------------------------
-    particle_measurements = zeros(N, M);
-
-    for i = 1:N
-        particle_measurements(i,:) = compute_lidar_measurement( ...
-            read_only_vars.map, ...
-            particles(i,:), ...
-            read_only_vars.lidar_config);
-    end
-
-    weights = weight_particles(particle_measurements, read_only_vars.lidar_distances);
-    weights = normalize_weights(weights, N);
+    % Faster version:
+    % The pose estimator below is density-based, so we do not need
+    % a second lidar simulation pass in the same iteration.
+    weights = ones(N,1) / N;
 end
 
 

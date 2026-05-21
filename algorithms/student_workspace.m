@@ -5,6 +5,15 @@ function public_vars = student_workspace(read_only_vars, public_vars)
 % No MoCap is used.
 % Outdoor: EKF/GNSS.
 % Indoor / GNSS denied: PF + lidar.
+%
+% Compatible with plan_motion.m using:
+%   - public_vars.path_idx
+%   - public_vars.startup_align_done
+%
+% This version does NOT use:
+%   - wp_idx
+%   - drive_enabled
+%   - turn_sign
 
     % ============================================================
     % 0) Initialization
@@ -15,10 +24,15 @@ function public_vars = student_workspace(read_only_vars, public_vars)
         public_vars.motion_vector = [0 0];
         public_vars.prev_motion_vector = [0 0];
 
+        % Path state
         public_vars.path = [];
         public_vars.path_idx = 1;
         public_vars.replan_counter = 999;
 
+        % Rotate-first state used by plan_motion()
+        public_vars.startup_align_done = false;
+
+        % PF state
         public_vars.pf_lock_counter = 0;
         public_vars.pf_wait_counter = 0;
         public_vars.pf_global_search = true;
@@ -36,6 +50,8 @@ function public_vars = student_workspace(read_only_vars, public_vars)
         % Important: never start with fake pose [0 0 0].
         public_vars.estimated_pose = [NaN NaN NaN];
         public_vars.estimated_pose_filt = [NaN NaN NaN];
+        public_vars.pose_control = [NaN NaN NaN];
+
         public_vars.pose_valid = false;
         public_vars.last_mode_id = 0;
 
@@ -52,9 +68,7 @@ function public_vars = student_workspace(read_only_vars, public_vars)
         public_vars.emergency_counter = 0;
         public_vars.search_counter = 0;
 
-        % ========================================================
         % Internal counters
-        % ========================================================
         public_vars.loop_counter = 0;
         public_vars.replan_total = 0;
         public_vars.pf_search_total = 0;
@@ -107,13 +121,12 @@ function public_vars = student_workspace(read_only_vars, public_vars)
         public_vars.pf_global_search = false;
         public_vars.pf_seeded_from_gnss = true;
 
-        public_vars.path = [];
-        public_vars.path_idx = 1;
-        public_vars.replan_counter = 999;
+        public_vars = reset_path_state(public_vars);
 
         public_vars.estimated_pose = public_vars.mu(:)';
         public_vars.estimated_pose(3) = wrap_angle(public_vars.estimated_pose(3));
         public_vars.estimated_pose_filt = public_vars.estimated_pose;
+        public_vars.pose_control = public_vars.estimated_pose;
 
         public_vars.pose_valid = true;
         public_vars.last_mode_id = 2;
@@ -153,18 +166,17 @@ function public_vars = student_workspace(read_only_vars, public_vars)
         % PF lock conditions
         % --------------------------------------------------------
         if public_vars.pf_seeded_from_gnss
-            required_lock_count = 10;
-            spread_limit = 0.80;
-            mass_limit = 0.08;
-            wait_before_planning = 11;
-        else
-            required_lock_count = 18;
-            spread_limit = 0.70;
+            required_lock_count = 6;
+            spread_limit = 0.90;
             mass_limit = 0.06;
-            wait_before_planning = 14;
+            wait_before_planning = 5;
+        else
+            required_lock_count = 10;
+            spread_limit = 0.85;
+            mass_limit = 0.05;
+            wait_before_planning = 7;
         end
 
-        % Lock according to particle density, not according to scan_error.
         if spread < spread_limit && cluster_mass > mass_limit
             public_vars.pf_lock_counter = public_vars.pf_lock_counter + 1;
 
@@ -175,7 +187,6 @@ function public_vars = student_workspace(read_only_vars, public_vars)
             public_vars.pf_lock_counter = 0;
         end
 
-        % Do not validate too early.
         if public_vars.pf_lock_counter >= 5
             public_vars.pose_valid = true;
         else
@@ -197,12 +208,11 @@ function public_vars = student_workspace(read_only_vars, public_vars)
 
             if public_vars.pf_wait_counter < wait_before_planning
 
-                public_vars.path = [];
-                public_vars.path_idx = 1;
-                public_vars.replan_counter = 999;
+                public_vars = reset_path_state(public_vars);
 
-                % Small stable arc to collect different lidar views.
-                public_vars.motion_vector = [0.07 -0.07];
+                % Rotate slowly to collect different lidar views.
+                public_vars.motion_vector = [0.10 -0.10];
+
                 public_vars.motion_vector = safety_lidar( ...
                     public_vars.motion_vector, ...
                     read_only_vars, ...
@@ -232,12 +242,9 @@ function public_vars = student_workspace(read_only_vars, public_vars)
     if numel(public_vars.estimated_pose) ~= 3 || any(~isfinite(public_vars.estimated_pose))
 
         public_vars.pose_valid = false;
+        public_vars = reset_path_state(public_vars);
 
-        public_vars.path = [];
-        public_vars.path_idx = 1;
-        public_vars.replan_counter = 999;
-
-        public_vars.motion_vector = [0.08 0.05];
+        public_vars.motion_vector = [0.12 0.08];
         public_vars.motion_vector = safety_lidar(public_vars.motion_vector, read_only_vars);
         public_vars.prev_motion_vector = public_vars.motion_vector;
         return;
@@ -263,10 +270,11 @@ function public_vars = student_workspace(read_only_vars, public_vars)
         public_vars.last_pose_check = public_vars.estimated_pose;
 
     else
+      
         if mode_id == 1
-            alpha = 0.25;     % GNSS/EKF
+            alpha = 0.30;     % GNSS/EKF
         else
-            alpha = 0.10;     % PF smoother, less jumpy indoors
+            alpha = 0.20;     % PF indoor
         end
 
         old = public_vars.estimated_pose_filt;
@@ -283,6 +291,53 @@ function public_vars = student_workspace(read_only_vars, public_vars)
     public_vars.estimated_pose(3) = wrap_angle(public_vars.estimated_pose(3));
 
     % ============================================================
+    % 6a) Pose prediction for CONTROL ONLY
+    % ============================================================
+
+    public_vars.pose_control = public_vars.estimated_pose;
+
+    if isfield(public_vars, 'prev_motion_vector') && ...
+       numel(public_vars.prev_motion_vector) == 2 && ...
+       all(isfinite(public_vars.prev_motion_vector)) && ...
+       isfield(read_only_vars, 'agent_drive') && ...
+       isfield(read_only_vars.agent_drive, 'interwheel_dist')
+
+        vL = public_vars.prev_motion_vector(1);
+        vR = public_vars.prev_motion_vector(2);
+
+        L = read_only_vars.agent_drive.interwheel_dist;
+
+        v = 0.5 * (vR + vL);
+        w = (vR - vL) / L;
+
+        th = public_vars.estimated_pose(3);
+
+        if mode_id == 1
+            % Outdoor GNSS/EKF:
+            % no artificial forward prediction, because it was cutting/overshooting.
+            pred_time = 0.00;
+        else
+            % Indoor PF:
+            % compensate filter/PF delay only for control.
+            pred_time = 0.22;
+        end
+
+        % When only rotating, predict mainly heading and do not move pose too far.
+        if abs(v) < 0.05 && abs(w) > 0.15
+            pred_time = min(pred_time, 0.10);
+        end
+
+        public_vars.pose_control(1) = public_vars.estimated_pose(1) + ...
+            v * cos(th) * pred_time;
+
+        public_vars.pose_control(2) = public_vars.estimated_pose(2) + ...
+            v * sin(th) * pred_time;
+
+        public_vars.pose_control(3) = wrap_angle( ...
+            public_vars.estimated_pose(3) + w * pred_time);
+    end
+
+    % ============================================================
     % 7) Path planning
     % ============================================================
     public_vars.replan_counter = public_vars.replan_counter + 1;
@@ -294,9 +349,12 @@ function public_vars = student_workspace(read_only_vars, public_vars)
         d_path = distance_to_path(public_vars.estimated_pose(1:2), public_vars.path);
 
         if d_path > 0.6 && d_path <= 2.0
-            public_vars.path_idx = nearest_path_index( ...
+            idx_near = nearest_path_index( ...
                 public_vars.estimated_pose(1:2), ...
                 public_vars.path);
+
+            % Do not jump backwards on same path.
+            public_vars.path_idx = max(public_vars.path_idx, idx_near);
         end
 
         if public_vars.replan_counter > 160 && d_path > 2.0
@@ -315,13 +373,11 @@ function public_vars = student_workspace(read_only_vars, public_vars)
             pf_can_plan = true;
         end
 
-        % More strict: avoid following false symmetric cluster.
-        if public_vars.pf_lock_counter >= 10
+        if public_vars.pf_lock_counter >= 6
             pf_can_follow = true;
         end
     end
 
-    % In symmetric indoor maps do not plan from an unvalidated PF pose.
     can_plan = gnss_ok || ...
                (pf_can_plan && public_vars.pose_valid);
 
@@ -329,11 +385,37 @@ function public_vars = student_workspace(read_only_vars, public_vars)
                       (pf_can_follow && public_vars.pose_valid);
 
     if need_replan && can_plan && public_vars.replan_counter > 25
-        public_vars.path = plan_path(read_only_vars, public_vars);
-        public_vars.path_idx = 1;
-        public_vars.replan_counter = 0;
 
-        public_vars.replan_total = public_vars.replan_total + 1;
+        new_path = plan_path(read_only_vars, public_vars);
+
+        if ~isempty(new_path) && size(new_path,1) >= 2
+
+            public_vars.path = new_path;
+
+            % Start from nearest point on new trajectory.
+            public_vars.path_idx = nearest_path_index( ...
+                public_vars.estimated_pose(1:2), ...
+                public_vars.path);
+
+            public_vars.path_idx = min(max(public_vars.path_idx, 1), size(public_vars.path,1));
+
+            % after every new path, robot must rotate first.
+            public_vars.startup_align_done = false;
+            public_vars.prev_motion_vector = [0 0];
+
+            public_vars.stuck_counter = 0;
+            public_vars.last_pose_check = public_vars.estimated_pose;
+
+            public_vars.replan_counter = 0;
+            public_vars.replan_total = public_vars.replan_total + 1;
+
+        else
+            public_vars = reset_path_state(public_vars);
+
+            public_vars.motion_vector = [0.08 -0.08];
+            public_vars.prev_motion_vector = public_vars.motion_vector;
+            return;
+        end
     end
 
     % ============================================================
@@ -354,8 +436,21 @@ function public_vars = student_workspace(read_only_vars, public_vars)
         public_vars.estimated_pose(1) - public_vars.last_pose_check(1), ...
         public_vars.estimated_pose(2) - public_vars.last_pose_check(2));
 
-    if move_dist < 0.05
+    cmd = public_vars.prev_motion_vector;
+    v_cmd = 0.5 * (cmd(1) + cmd(2));
+    w_cmd = abs(cmd(1) - cmd(2));
+
+    is_rotating_in_place = abs(v_cmd) < 0.08 && w_cmd > 0.08;
+    is_aligning = ~public_vars.startup_align_done && ~isempty(public_vars.path);
+
+    % Do not count rotate-first alignment as stuck.
+    if is_rotating_in_place || is_aligning
+        public_vars.stuck_counter = 0;
+        public_vars.last_pose_check = public_vars.estimated_pose;
+
+    elseif move_dist < 0.05
         public_vars.stuck_counter = public_vars.stuck_counter + 1;
+
     else
         public_vars.stuck_counter = 0;
         public_vars.last_pose_check = public_vars.estimated_pose;
@@ -378,7 +473,9 @@ function public_vars = student_workspace(read_only_vars, public_vars)
     cmd_mag = max(abs(public_vars.prev_motion_vector));
     progress = public_vars.last_goal_distance - goal_dist;
 
-    if cmd_mag > 0.03 && progress < 0.005 && ~gnss_ok
+    is_aligning = ~public_vars.startup_align_done && ~isempty(public_vars.path);
+
+    if cmd_mag > 0.03 && progress < 0.005 && ~gnss_ok && ~is_aligning
         public_vars.localization_fail_counter = public_vars.localization_fail_counter + 1;
     else
         public_vars.localization_fail_counter = max(public_vars.localization_fail_counter - 2, 0);
@@ -386,10 +483,11 @@ function public_vars = student_workspace(read_only_vars, public_vars)
 
     public_vars.last_goal_distance = goal_dist;
 
-    if public_vars.localization_fail_counter > 160
+    if public_vars.localization_fail_counter > 220
+
         public_vars = reset_localization(read_only_vars, public_vars);
 
-        public_vars.motion_vector = [0.08 0.05];
+        public_vars.motion_vector = [0.12 0.08];
         public_vars.motion_vector = safety_lidar( ...
             public_vars.motion_vector, ...
             read_only_vars, ...
@@ -402,46 +500,37 @@ function public_vars = student_workspace(read_only_vars, public_vars)
     % ============================================================
     % 10) Motion
     % ============================================================
-
-    % Emergency obstacle handling must be before all motion returns.
     [emergency, ~] = obstacle_emergency(read_only_vars);
 
     if emergency || public_vars.emergency_mode
 
         public_vars.emergency_total = public_vars.emergency_total + 1;
-    
+
         public_vars.emergency_mode = true;
         public_vars.emergency_counter = public_vars.emergency_counter + 1;
-    
+
         if public_vars.emergency_counter == 1
-            public_vars.path = [];
-            public_vars.path_idx = 1;
-            public_vars.replan_counter = 999;
+            public_vars = reset_path_state(public_vars);
         end
-    
-        % 1) Nejdřív couvej výrazněji a déle.
-        if public_vars.emergency_counter < 14
-            public_vars.motion_vector = [-0.18 -0.16];
-    
-        % 2) Potom se otoč na místě, aby lidar našel volnější směr.
-        elseif public_vars.emergency_counter < 28
-            public_vars.motion_vector = [0.14 -0.14];
-    
-        % 3) Krátký pomalý rozjezd dopředu, ale bez agresivního plánování.
-        elseif public_vars.emergency_counter < 36
-            public_vars.motion_vector = [0.08 0.06];
-    
+
+        if public_vars.emergency_counter < 8
+            public_vars.motion_vector = [-0.22 -0.18];
+
+        elseif public_vars.emergency_counter < 18
+            public_vars.motion_vector = [0.18 -0.18];
+
+        elseif public_vars.emergency_counter < 24
+            public_vars.motion_vector = [0.14 0.10];
+
         else
             public_vars.emergency_mode = false;
             public_vars.emergency_counter = 0;
-    
-            public_vars.path = [];
-            public_vars.path_idx = 1;
-            public_vars.replan_counter = 999;
-    
+
+            public_vars = reset_path_state(public_vars);
+
             public_vars.motion_vector = [0.06 0.05];
         end
-    
+
         public_vars.prev_motion_vector = public_vars.motion_vector;
         return;
     end
@@ -449,7 +538,8 @@ function public_vars = student_workspace(read_only_vars, public_vars)
     if isempty(public_vars.path)
 
         % No trusted path yet: move slowly and collect more lidar.
-        public_vars.motion_vector = [0.08 0.05];
+        public_vars.motion_vector = [0.12 0.08];
+
         public_vars.motion_vector = safety_lidar( ...
             public_vars.motion_vector, ...
             read_only_vars, ...
@@ -459,7 +549,7 @@ function public_vars = student_workspace(read_only_vars, public_vars)
         return;
     end
 
-    if public_vars.stuck_counter > 80
+    if public_vars.stuck_counter > 140
 
         public_vars.stuck_total = public_vars.stuck_total + 1;
 
@@ -469,7 +559,6 @@ function public_vars = student_workspace(read_only_vars, public_vars)
         public_vars.prev_motion_vector = public_vars.motion_vector;
 
         public_vars.stuck_counter = 0;
-
         return;
     end
 
@@ -482,7 +571,7 @@ function public_vars = student_workspace(read_only_vars, public_vars)
         public_vars.search_counter = public_vars.search_counter + 1;
 
         if public_vars.search_counter < 25
-            public_vars.motion_vector = [0.08 0.05];
+            public_vars.motion_vector = [0.12 0.08];
 
         elseif public_vars.search_counter < 55
             public_vars.motion_vector = [0.06 -0.06];
@@ -490,11 +579,9 @@ function public_vars = student_workspace(read_only_vars, public_vars)
         else
             public_vars.search_counter = 0;
 
-            public_vars.path = [];
-            public_vars.path_idx = 1;
-            public_vars.replan_counter = 999;
+            public_vars = reset_path_state(public_vars);
 
-            public_vars.motion_vector = [0.08 0.05];
+            public_vars.motion_vector = [0.12 0.08];
         end
 
         public_vars.motion_vector = safety_lidar( ...
@@ -506,7 +593,25 @@ function public_vars = student_workspace(read_only_vars, public_vars)
         return;
     end
 
+    % ============================================================
+    % 11) Normal path following
+    % ============================================================
+    % Use predicted pose only for control.
+    % Restore estimated_pose immediately afterwards.
+
+    pose_saved = public_vars.estimated_pose;
+
+    if isfield(public_vars, 'pose_control') && ...
+       numel(public_vars.pose_control) == 3 && ...
+       all(isfinite(public_vars.pose_control))
+
+        public_vars.estimated_pose = public_vars.pose_control;
+    end
+
     [mv, public_vars] = plan_motion(read_only_vars, public_vars);
+
+    public_vars.estimated_pose = pose_saved;
+
     public_vars.motion_vector = mv(:)';
 
     if numel(public_vars.motion_vector) ~= 2 || any(~isfinite(public_vars.motion_vector))
@@ -518,7 +623,7 @@ function public_vars = student_workspace(read_only_vars, public_vars)
     d_goal = hypot( ...
         public_vars.estimated_pose(1) - goal(1), ...
         public_vars.estimated_pose(2) - goal(2));
-    
+
     goal_stop_tol = min(0.25, 0.60 * goal_tol);
 
     if d_goal < goal_stop_tol
@@ -532,10 +637,20 @@ function public_vars = student_workspace(read_only_vars, public_vars)
         return;
     end
 
+    % Safety can use pose_control because it predicts near-future pose.
+    if isfield(public_vars, 'pose_control') && ...
+       numel(public_vars.pose_control) == 3 && ...
+       all(isfinite(public_vars.pose_control))
+
+        safety_pose = public_vars.pose_control;
+    else
+        safety_pose = public_vars.estimated_pose;
+    end
+
     public_vars.motion_vector = safety_lidar( ...
         public_vars.motion_vector, ...
         read_only_vars, ...
-        public_vars.estimated_pose);
+        safety_pose);
 
     public_vars.prev_motion_vector = public_vars.motion_vector;
 end
@@ -545,11 +660,26 @@ end
 % Helper functions
 % ========================================================================
 
-function public_vars = reset_localization(read_only_vars, public_vars)
+function public_vars = reset_path_state(public_vars)
+% Reset all variables related to path following and rotate-first behavior.
 
     public_vars.path = [];
     public_vars.path_idx = 1;
+
+    public_vars.startup_align_done = false;
+
     public_vars.replan_counter = 999;
+    public_vars.prev_motion_vector = [0 0];
+
+    if isfield(public_vars, 'pose_control')
+        public_vars.pose_control = [NaN NaN NaN];
+    end
+end
+
+
+function public_vars = reset_localization(read_only_vars, public_vars)
+
+    public_vars = reset_path_state(public_vars);
 
     public_vars.pf_lock_counter = 0;
     public_vars.pf_wait_counter = 0;
@@ -561,23 +691,40 @@ function public_vars = reset_localization(read_only_vars, public_vars)
 
     public_vars.relocalization_counter = public_vars.relocalization_counter + 1;
 
-    public_vars.pf_global_search = true;
-    public_vars.pf_seeded_from_gnss = false;
-    public_vars.pose_valid = false;
+    % If we still have a finite pose, do local reseed instead of full global reset.
+    if isfield(public_vars, 'estimated_pose') && ...
+       numel(public_vars.estimated_pose) == 3 && ...
+       all(isfinite(public_vars.estimated_pose))
+
+        public_vars = seed_particles_around_pose( ...
+            public_vars, ...
+            public_vars.estimated_pose, ...
+            read_only_vars);
+
+        public_vars.pf_global_search = false;
+        public_vars.pf_seeded_from_gnss = true;
+        public_vars.pose_valid = true;
+
+    else
+        public_vars.pf_global_search = true;
+        public_vars.pf_seeded_from_gnss = false;
+        public_vars.pose_valid = false;
+
+        public_vars = init_particle_filter(read_only_vars, public_vars);
+    end
 
     public_vars.emergency_mode = false;
     public_vars.emergency_counter = 0;
     public_vars.search_counter = 0;
-
-    public_vars = init_particle_filter(read_only_vars, public_vars);
 end
+
 
 function n = required_pf_wait(public_vars)
 
     if isfield(public_vars, 'pf_seeded_from_gnss') && public_vars.pf_seeded_from_gnss
-        n = 8;
+        n = 4;
     else
-        n = 10;
+        n = 7;
     end
 end
 
@@ -614,9 +761,7 @@ end
 
 
 function motion_vector = safety_lidar(motion_vector, read_only_vars, pose)
-% SAFETY_LIDAR
 % Soft safety: slows down before obstacles.
-% Emergency reverse is handled separately by obstacle_emergency().
 
     if numel(motion_vector) ~= 2 || any(~isfinite(motion_vector))
         motion_vector = [0 0];
@@ -655,10 +800,10 @@ function motion_vector = safety_lidar(motion_vector, read_only_vars, pose)
     if any(front_wide)
         min_front_wide = min(z(front_wide));
 
-        if min_front_wide < 0.2
-            motion_vector = 0.4 * motion_vector;
-        elseif min_front_wide < 0.3
-            motion_vector = 0.70 * motion_vector;
+        if min_front_wide < 0.18
+            motion_vector = 0.55 * motion_vector;
+        elseif min_front_wide < 0.27
+            motion_vector = 0.82 * motion_vector;
         end
     end
 
@@ -675,8 +820,8 @@ function motion_vector = safety_lidar(motion_vector, read_only_vars, pose)
 
     L = read_only_vars.agent_drive.interwheel_dist;
 
-    vR = motion_vector(1);
-    vL = motion_vector(2);
+    vL = motion_vector(1);
+    vR = motion_vector(2);
 
     v = 0.5 * (vR + vL);
     w = (vR - vL) / L;
@@ -685,7 +830,7 @@ function motion_vector = safety_lidar(motion_vector, read_only_vars, pose)
     y = pose(2);
     theta = wrap_angle(pose(3));
 
-    lookahead_time = 0.45;
+    lookahead_time = 0.30;
 
     x_pred = x + v * cos(theta) * lookahead_time;
     y_pred = y + v * sin(theta) * lookahead_time;
@@ -696,12 +841,12 @@ function motion_vector = safety_lidar(motion_vector, read_only_vars, pose)
     x_nose = x_pred + nose_dist * cos(th_pred);
     y_nose = y_pred + nose_dist * sin(th_pred);
 
-    clearance = 0.18;
+    clearance = 0.14;
 
     if ~point_safe_from_walls(x_pred, y_pred, read_only_vars.map.walls, clearance) || ...
        ~point_safe_from_walls(x_nose, y_nose, read_only_vars.map.walls, clearance)
 
-        motion_vector = 0.45 * motion_vector;
+        motion_vector = 0.70 * motion_vector;
     end
 end
 
@@ -740,55 +885,13 @@ function [emergency, min_front] = obstacle_emergency(read_only_vars)
 
     min_front = min(z(front));
 
-    if min_front < 0.12
+    if min_front < 0.10
         emergency = true;
     end
 end
 
 
-function e = lidar_pose_error(read_only_vars, pose)
-
-    e = inf;
-
-    if numel(pose) ~= 3 || any(~isfinite(pose))
-        return;
-    end
-
-    if ~isfield(read_only_vars,'lidar_distances') || isempty(read_only_vars.lidar_distances)
-        return;
-    end
-
-    if ~isfield(read_only_vars,'lidar_config') || isempty(read_only_vars.lidar_config)
-        return;
-    end
-
-    z_real = read_only_vars.lidar_distances(:)';
-
-    z_pred = compute_lidar_measurement( ...
-        read_only_vars.map, ...
-        pose, ...
-        read_only_vars.lidar_config);
-
-    M = min(numel(z_real), numel(z_pred));
-
-    z_real = z_real(1:M);
-    z_pred = z_pred(1:M);
-
-    valid = isfinite(z_real) & isfinite(z_pred) & z_real > 0 & z_pred > 0;
-
-    if sum(valid) < 3
-        return;
-    end
-
-    err = z_real(valid) - z_pred(valid);
-    err = max(-2.0, min(2.0, err));
-
-    e = sqrt(mean(err.^2));
-end
-
-
 function spread = particle_spread(particles, weights)
-% PARTICLE_SPREAD
 % Density-based spread, compatible with resampled PF where weights may be uniform.
 
     N = size(particles,1);
@@ -840,7 +943,6 @@ end
 
 
 function mass = particle_cluster_mass(particles, weights)
-% PARTICLE_CLUSTER_MASS
 % Density-based cluster mass = fraction of particles in strongest cluster.
 
     N = size(particles,1);

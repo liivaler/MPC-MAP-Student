@@ -15,7 +15,7 @@ function public_vars = init_particle_filter(read_only_vars, public_vars)
     if isfield(read_only_vars, 'max_particles') && read_only_vars.max_particles > 0
         N = read_only_vars.max_particles;
     else
-        N = 1000;
+        N = 600;
     end
 
     public_vars.Npf = N;
@@ -52,7 +52,7 @@ function public_vars = init_particle_filter(read_only_vars, public_vars)
 
         % More candidates than final particles.
         % Keep this local only, not in public_vars.
-        Ncand = max(8000, 8*N);
+        Ncand = max(3000, 5*N);
 
         candidates = zeros(Ncand, 3);
 

@@ -1,4 +1,4 @@
-map_name = 'maps/indoor_1.txt';
+map_name = 'maps/outdoor_1.txt';
 
 % náhodný bezpečný start ve volném prostoru
 tmp_map = load_map(map_name);

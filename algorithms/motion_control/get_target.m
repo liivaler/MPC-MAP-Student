@@ -1,7 +1,5 @@
 function [target] = get_target(estimated_pose, path)
-% GET_TARGET
-% Pomocná funkce pro výběr bodu na trase před robotem.
-% Ve finální verzi se hlavní výběr cíle řeší přímo v plan_motion.m.
+
 
     if isempty(path)
         target = [0, 0];

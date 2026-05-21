@@ -10,7 +10,7 @@ function [new_path] = smooth_path(old_path, read_only_vars)
 
     alpha = 0.1;      % keeps path close to original
     beta  = 0.2;      % smoothing strength
-    iterations = 80;
+    iterations = 25;
 
     for it = 1:iterations
         for i = 2:size(old_path,1)-1
@@ -37,7 +37,7 @@ function safe = is_path_safe(path, read_only_vars)
     walls = read_only_vars.map.walls;
     limits = read_only_vars.map.limits;
 
-    clearance = 0.3;
+    clearance = 0.20;
 
     xmin = limits(1);
     ymin = limits(2);
@@ -50,7 +50,7 @@ function safe = is_path_safe(path, read_only_vars)
         p2 = path(i+1,:);
 
         dist = norm(p2 - p1);
-        n = max(2, ceil(dist / 0.05));
+        n = max(2, ceil(dist / 0.10));
 
         for k = 0:n
 

@@ -1,5 +1,4 @@
 function path = plan_path(read_only_vars, public_vars)
-% PLAN_PATH
 % Week 6 path planning wrapper.
 % Uses A* and optional smoothing.
 
